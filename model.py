@@ -328,3 +328,30 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    def update_vocab_size(self, new_vocab_size):
+        """Update model to use a new vocabulary size by reinitializing embeddings."""
+        if new_vocab_size == self.config.vocab_size:
+            return
+
+        old_vocab_size = self.config.vocab_size
+        self.config.vocab_size = new_vocab_size
+
+        # Recreate embeddings with new vocab size
+        self.transformer.wte = nn.Embedding(new_vocab_size, self.config.n_embd)
+        self.lm_head = nn.Linear(self.config.n_embd, new_vocab_size, bias=False)
+
+        # Weight tying
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # Reinitialize
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.02)
+
+        print(f"Updated vocab size: {old_vocab_size} -> {new_vocab_size}")
+
+    def strip_embeddings(self):
+        """Reinitialize embedding layers while keeping transformer blocks."""
+        print("Stripping embeddings (reinitializing wte, wpe, lm_head)...")
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
+        # lm_head shares weights with wte due to weight tying, so no need to reinit separately
