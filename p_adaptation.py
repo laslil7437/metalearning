@@ -1,64 +1,53 @@
+"""
+P-Adaptation: Meta-learn plasticity masks across tasks.
+Weights reset each task - only the learning architecture is inherited.
+"""
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 import os
 import json
 import numpy as np
-from tqdm import tqdm
-import time
+import pickle
 import matplotlib.pyplot as plt
 
 from model import GPT, GPTConfig
 
 
-class TextDataset(Dataset):
-    """Text dataset for language training"""
-    def __init__(self, text_file, tokenizer, block_size=256, max_samples=None):
-        print(f"Loading dataset from {text_file}...")
-
-        self.tokenizer = tokenizer
-        self.block_size = block_size
-
-        with open(text_file, 'r', encoding='utf-8') as f:
-            text = f.read()
-
-        self.tokens = tokenizer.encode(text)
-
-        if max_samples:
-            max_tokens = max_samples * block_size
-            self.tokens = self.tokens[:max_tokens]
-
-        print(f"Dataset loaded: {len(self.tokens)} tokens")
-
-    def __len__(self):
-        return len(self.tokens) - self.block_size
-
-    def __getitem__(self, idx):
-        chunk = self.tokens[idx:idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
-        return x, y
+def load_dataset_info(data_dir):
+    """Load vocabulary size from meta.pkl."""
+    meta_path = os.path.join(data_dir, 'meta.pkl')
+    if os.path.exists(meta_path):
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        vocab_size = meta['vocab_size']
+        print(f"  Found vocab_size = {vocab_size} in {meta_path}")
+    else:
+        vocab_size = 50304  # GPT-2 default
+        print(f"  No meta.pkl found, defaulting vocab_size = {vocab_size}")
+    return vocab_size
 
 
-class SimpleTokenizer:
-    """Minimal character-level tokenizer for testing"""
-    def __init__(self, vocab=None):
-        if vocab is None:
-            # Default ASCII vocab
-            self.char_to_idx = {chr(i): i for i in range(256)}
-            self.idx_to_char = {i: chr(i) for i in range(256)}
-        else:
-            self.char_to_idx = vocab
-            self.idx_to_char = {v: k for k, v in vocab.items()}
+def get_batch(data_dir, split, batch_size, block_size, device):
+    """
+    Load a batch from memory-mapped binary file.
+    Same approach as train.py - recreate memmap each call to avoid memory leak.
+    """
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-    def encode(self, text):
-        return [self.char_to_idx.get(c, 0) for c in text]
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
 
-    def decode(self, tokens):
-        return ''.join([self.idx_to_char.get(t, '?') for t in tokens])
+    if 'cuda' in device:
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
 
-    def get_vocab_size(self):
-        return len(self.char_to_idx)
+    return x, y
 
 
 class PAdaptationMetaLearner:
@@ -78,7 +67,7 @@ class PAdaptationMetaLearner:
         P = {}
         for name, param in model.named_parameters():
             # Skip embeddings, meta-learn transformer only
-            if 'blocks' in name or 'ln_f' in name:
+            if 'transformer.h.' in name or 'transformer.ln_f' in name:
                 P[name] = torch.ones_like(param.data)
 
         print(f"Initialized P with {len(P)} parameter groups")
@@ -89,12 +78,12 @@ class PAdaptationMetaLearner:
         print("Resetting model weights to random...")
 
         for name, param in model.named_parameters():
-            if 'blocks' in name or 'ln_f' in name:
+            if 'transformer.h.' in name or 'transformer.ln_f' in name:
                 if 'weight' in name:
                     if len(param.shape) >= 2:
                         # Linear layers: normal init with proper scaling
                         std = 0.02
-                        if hasattr(param, 'NANOGPT_SCALE_INIT'):
+                        if name.endswith('c_proj.weight'):
                             std *= (2 * self.model_config.n_layer) ** -0.5
                         nn.init.normal_(param.data, mean=0.0, std=std)
                     else:
@@ -103,14 +92,15 @@ class PAdaptationMetaLearner:
                 elif 'bias' in name:
                     nn.init.zeros_(param.data)
 
-    def train_task_with_P(self, model, dataset, P, train_config):
-        """Train with P-masked gradients. Returns final params, trajectory, losses."""
+    def train_task_with_P(self, model, data_dir, P, train_config):
+        """Train with P-masked gradients using get_batch. Returns final params, trajectory, losses."""
         device = train_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
         model.train()
 
         # Training config
         batch_size = train_config.get('batch_size', 32)
+        block_size = self.model_config.block_size
         learning_rate = train_config.get('learning_rate', 3e-4)
         max_iters = train_config.get('max_iters', 1000)
         checkpoint_interval = train_config.get('checkpoint_interval', 100)
@@ -120,14 +110,6 @@ class PAdaptationMetaLearner:
             model.parameters(),
             lr=learning_rate,
             weight_decay=train_config.get('weight_decay', 0.1)
-        )
-
-        # DataLoader
-        train_loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0
         )
 
         # Store initial params
@@ -142,17 +124,10 @@ class PAdaptationMetaLearner:
         losses = []
 
         print(f"Training with P-masked gradients for {max_iters} iterations...")
-        train_iter = iter(train_loader)
 
         for iter_num in range(max_iters):
-            # Get batch
-            try:
-                x, y = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                x, y = next(train_iter)
-
-            x, y = x.to(device), y.to(device)
+            # Get batch using memmap approach
+            x, y = get_batch(data_dir, 'train', batch_size, block_size, device)
 
             # Forward pass
             logits, loss = model(x, y)
@@ -202,9 +177,11 @@ class PAdaptationMetaLearner:
 
         return final_params, trajectory, losses, initial_params
 
-    def compute_P_gradient(self, initial_params, trajectory, model, dataset, P, train_config):
+    def compute_P_gradient(self, initial_params, trajectory, model, data_dir, P, train_config):
         """Compute P gradient from trajectory: ΔP ∝ Σ P^{-1} ⊙ (Θ_n - Θ_0) ⊙ ∇L|_n"""
         device = train_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        batch_size = train_config.get('batch_size', 32)
+        block_size = self.model_config.block_size
         model.eval()
 
         P_grad = {name: torch.zeros_like(P[name]) for name in P.keys()}
@@ -225,12 +202,8 @@ class PAdaptationMetaLearner:
             grad_accumulator = {name: torch.zeros_like(P[name]) for name in P.keys()}
             n_grad_batches = train_config.get('n_grad_batches', 5)
 
-            dataloader = DataLoader(dataset, batch_size=train_config.get('batch_size', 32), shuffle=True)
-            for i, (x, y) in enumerate(dataloader):
-                if i >= n_grad_batches:
-                    break
-
-                x, y = x.to(device), y.to(device)
+            for i in range(n_grad_batches):
+                x, y = get_batch(data_dir, 'train', batch_size, block_size, device)
 
                 # Compute gradient
                 model.zero_grad()
@@ -279,14 +252,19 @@ class PAdaptationMetaLearner:
         print(f"  Saved P to {save_path}")
 
     def run_P_metalearning(self,
-                           dataset_paths,
-                           tokenizers,
+                           dataset_dirs,
                            train_config,
                            num_iterations=10,
                            meta_learning_rate=0.1):
         """
         Meta-learn P across language tasks. Each task: reset weights, train with P,
         compute P gradient, update P. Only P is inherited.
+
+        Args:
+            dataset_dirs: List of data directories, each containing train.bin and meta.pkl
+            train_config: Training hyperparameters
+            num_iterations: Number of meta-iterations
+            meta_learning_rate: P update step size
         """
         print("\n" + "="*80)
         print("P-ONLY META-LEARNING")
@@ -298,20 +276,22 @@ class PAdaptationMetaLearner:
         model = None
 
         for iteration in range(num_iterations):
-            dataset_idx = iteration % len(dataset_paths)
-            dataset_path = dataset_paths[dataset_idx]
-            tokenizer = tokenizers[dataset_idx]
+            dataset_idx = iteration % len(dataset_dirs)
+            data_dir = dataset_dirs[dataset_idx]
 
             print(f"\n{'='*80}")
             print(f"META-ITERATION {iteration + 1}/{num_iterations}")
-            print(f"Language: {dataset_path}")
-            print(f"Vocab size: {tokenizer.get_vocab_size()}")
+            print(f"Dataset: {data_dir}")
+
+            # Load vocab size for this dataset
+            vocab_size = load_dataset_info(data_dir)
+            print(f"Vocab size: {vocab_size}")
             print(f"{'='*80}\n")
 
             # Create/reset model for this task
             if model is None:
                 # First iteration: create model and initialize P
-                self.model_config.vocab_size = tokenizer.get_vocab_size()
+                self.model_config.vocab_size = vocab_size
                 model = GPT(self.model_config)
                 self.P = self.initialize_P(model)
                 print("Created initial model and initialized P")
@@ -320,37 +300,29 @@ class PAdaptationMetaLearner:
                 self.reset_model_weights(model)
 
                 # Update vocab size if needed
-                if model.config.vocab_size != tokenizer.get_vocab_size():
-                    model.update_vocab_size(tokenizer.get_vocab_size())
+                if model.config.vocab_size != vocab_size:
+                    model.update_vocab_size(vocab_size)
                 else:
                     model.strip_embeddings()
-
-            # Load dataset
-            dataset = TextDataset(
-                dataset_path,
-                tokenizer,
-                block_size=self.model_config.block_size,
-                max_samples=train_config.get('max_samples', None)
-            )
 
             # Train with current P
             print("\nPhase 1: Training with P-masked gradients...")
             final_params, trajectory, losses, initial_params = self.train_task_with_P(
-                model, dataset, self.P, train_config
+                model, data_dir, self.P, train_config
             )
 
             # Track convergence
             final_loss = np.mean([loss for _, loss in losses[-100:]])
             self.loss_history.append({
                 'iteration': iteration,
-                'dataset': dataset_path,
+                'dataset': data_dir,
                 'final_loss': final_loss
             })
 
             # Compute P gradient
             print("\nPhase 2: Computing P gradient from trajectory...")
             P_grad = self.compute_P_gradient(
-                initial_params, trajectory, model, dataset, self.P, train_config
+                initial_params, trajectory, model, data_dir, self.P, train_config
             )
 
             # Update P
@@ -453,11 +425,13 @@ def main():
 
     # Configuration
     model_config = GPTConfig(
-        vocab_size=256,  # Will be updated per language
-        block_size=128,
+        vocab_size=50304,  # Will be updated per dataset
+        block_size=256,
         n_layer=4,
         n_head=4,
-        n_embd=256
+        n_embd=256,
+        dropout=0.0,
+        bias=True
     )
 
     train_config = {
@@ -468,43 +442,48 @@ def main():
         'n_grad_batches': 5,  # Average over 5 batches for P gradient
         'weight_decay': 0.1,
         'grad_clip': 1.0,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'max_samples': 5000  # Limit dataset size for quick testing
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
-    # For demonstration, we'll use simple text files
-    # In practice, you'd use real multilingual datasets
-
-    # Example: Create dummy datasets (you should replace with real data)
-    print("\nNOTE: This is a demonstration setup.")
-    print("Replace dataset_paths and tokenizers with real language data.\n")
-
-    dataset_paths = [
-        'data/english.txt',
-        'data/japanese.txt',
-        'data/arabic.txt',
-        'data/finnish.txt'
+    # Each dataset directory should contain train.bin, val.bin, and meta.pkl
+    # These should be created using the prepare.py script for each language
+    dataset_dirs = [
+        'data/english',
+        'data/japanese',
+        'data/arabic',
+        'data/finnish'
     ]
 
-    # Create simple tokenizers (replace with proper BPE tokenizers)
-    tokenizers = [SimpleTokenizer() for _ in dataset_paths]
-
     # Check if data exists
-    if not all(os.path.exists(p) for p in dataset_paths):
-        print("ERROR: Dataset files not found!")
-        print("Please create the following files with language data:")
-        for p in dataset_paths:
-            print(f"  - {p}")
-        print("\nOr modify the dataset_paths in the script.")
+    print("\nChecking for dataset directories...")
+    missing = []
+    for data_dir in dataset_dirs:
+        train_bin = os.path.join(data_dir, 'train.bin')
+        meta_pkl = os.path.join(data_dir, 'meta.pkl')
+        if not os.path.exists(train_bin):
+            missing.append(train_bin)
+        if not os.path.exists(meta_pkl):
+            missing.append(meta_pkl)
+
+    if missing:
+        print("\nERROR: Required dataset files not found!")
+        print("Missing files:")
+        for f in missing:
+            print(f"  - {f}")
+        print("\nFor each language, you need to:")
+        print("1. Create a directory (e.g., data/english/)")
+        print("2. Run the prepare.py script to generate train.bin and meta.pkl")
+        print("3. See data/openwebtext/prepare.py for an example")
         return
+
+    print("All dataset directories found!")
 
     # Create meta-learner
     meta_learner = PAdaptationMetaLearner(model_config, base_dir='p_adaptation_results')
 
     # Run P-only meta-learning
     final_P = meta_learner.run_P_metalearning(
-        dataset_paths=dataset_paths,
-        tokenizers=tokenizers,
+        dataset_dirs=dataset_dirs,
         train_config=train_config,
         num_iterations=8,  # 2 passes through 4 languages
         meta_learning_rate=0.1
