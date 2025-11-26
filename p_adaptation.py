@@ -1,7 +1,3 @@
-"""
-P-Adaptation: Meta-learn plasticity masks across tasks.
-Weights reset each task - only the learning architecture is inherited.
-"""
 
 import torch
 import torch.nn as nn
@@ -101,15 +97,17 @@ class PAdaptationMetaLearner:
         # Training config
         batch_size = train_config.get('batch_size', 32)
         block_size = self.model_config.block_size
-        learning_rate = train_config.get('learning_rate', 3e-4)
+        learning_rate = train_config.get('learning_rate', 1e-2) # SGD needs higher LR
         max_iters = train_config.get('max_iters', 1000)
         checkpoint_interval = train_config.get('checkpoint_interval', 100)
 
         # Optimizer
-        optimizer = torch.optim.AdamW(
+        # CHANGED: Switched to SGD + Momentum. Adam normalizes out P scaling.
+        optimizer = torch.optim.SGD(
             model.parameters(),
             lr=learning_rate,
-            weight_decay=train_config.get('weight_decay', 0.1)
+            momentum=0.9,
+            weight_decay=train_config.get('weight_decay', 0.0)
         )
 
         # Store initial params
@@ -228,9 +226,20 @@ class PAdaptationMetaLearner:
 
     def update_and_renormalize_P(self, P, P_grad, meta_lr):
         """Update P and renormalize: P* = (Tr(P) / Tr(P²)) * P"""
+        
+        # CHANGED: Added gradient clipping for evolutionary stability
+        max_norm = 1.0
+        total_norm = torch.norm(torch.stack([torch.norm(g) for g in P_grad.values()]))
+        if total_norm > max_norm:
+            scale = max_norm / (total_norm + 1e-6)
+            print(f"  Clipping P_grad norm: {total_norm:.2f} -> {max_norm}")
+            for g in P_grad.values():
+                g.mul_(scale)
+
         P_new = {}
         for name in P.keys():
-            P_new[name] = P[name] + meta_lr * P_grad[name]
+            # CHANGED: Changed '+' to '-' because we minimize loss (Fitness = -Loss)
+            P_new[name] = P[name] - meta_lr * P_grad[name]
             P_new[name] = torch.clamp(P_new[name], min=1e-6)  # Keep positive
 
         # Renormalize
@@ -434,13 +443,14 @@ def main():
         bias=True
     )
 
+    # CHANGED: SGD hyperparameters
     train_config = {
         'batch_size': 32,
-        'learning_rate': 3e-4,
+        'learning_rate': 1e-2,       # Higher LR for SGD
         'max_iters': 1000,
-        'checkpoint_interval': 200,  # Checkpoint every 200 iters
-        'n_grad_batches': 5,  # Average over 5 batches for P gradient
-        'weight_decay': 0.1,
+        'checkpoint_interval': 100,  # Checkpoint every 100 iters
+        'n_grad_batches': 10,        # Increased for stable selection pressure
+        'weight_decay': 0.0,         # SGD doesn't strictly need L2 here
         'grad_clip': 1.0,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
