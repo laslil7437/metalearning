@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import os
@@ -27,7 +26,7 @@ def load_dataset_info(data_dir):
 def get_batch(data_dir, split, batch_size, block_size, device):
     """
     Load a batch from memory-mapped binary file.
-    Same approach as train.py - recreate memmap each call to avoid memory leak.
+    Recreates memmap each call to avoid memory leak.
     """
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
@@ -47,19 +46,17 @@ def get_batch(data_dir, split, batch_size, block_size, device):
 
 
 class PAdaptationMetaLearner:
-    """Meta-learner that inherits plasticity masks P, not weights."""
 
     def __init__(self, model_config, base_dir='p_adaptation_experiments'):
         self.model_config = model_config
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
 
-        self.P = None  # Plasticity mask (inherited across tasks)
-        self.P_history = []  # Track P evolution
-        self.loss_history = []  # Track convergence
+        self.P = None  # Plasticity mask
+        self.P_history = []  # Tracks P evolution
+        self.loss_history = []  # Tracks convergence
 
     def initialize_P(self, model):
-        """Init plasticity mask P with uniform values for transformer params."""
         P = {}
         for name, param in model.named_parameters():
             # Skip embeddings, meta-learn transformer only
@@ -89,7 +86,7 @@ class PAdaptationMetaLearner:
                     nn.init.zeros_(param.data)
 
     def train_task_with_P(self, model, data_dir, P, train_config):
-        """Train with P-masked gradients using get_batch. Returns final params, trajectory, losses."""
+        """Trains with P-masked gradients using get_batch. Returns final params, trajectory, losses."""
         device = train_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
         model.train()
@@ -102,15 +99,13 @@ class PAdaptationMetaLearner:
         checkpoint_interval = train_config.get('checkpoint_interval', 100)
 
         # Optimizer
-        # CHANGED: Switched to SGD + Momentum. Adam normalizes out P scaling.
         optimizer = torch.optim.SGD(
             model.parameters(),
             lr=learning_rate,
-            momentum=0.9,
             weight_decay=train_config.get('weight_decay', 0.0)
         )
 
-        # Store initial params
+        # Store the initial params.
         initial_params = {
             name: param.data.clone()
             for name, param in model.named_parameters()
@@ -124,7 +119,7 @@ class PAdaptationMetaLearner:
         print(f"Training with P-masked gradients for {max_iters} iterations...")
 
         for iter_num in range(max_iters):
-            # Get batch using memmap approach
+            # Get batch using memmap
             x, y = get_batch(data_dir, 'train', batch_size, block_size, device)
 
             # Forward pass
@@ -176,7 +171,6 @@ class PAdaptationMetaLearner:
         return final_params, trajectory, losses, initial_params
 
     def compute_P_gradient(self, initial_params, trajectory, model, data_dir, P, train_config):
-        """Compute P gradient from trajectory: ΔP ∝ Σ P^{-1} ⊙ (Θ_n - Θ_0) ⊙ ∇L|_n"""
         device = train_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         batch_size = train_config.get('batch_size', 32)
         block_size = self.model_config.block_size
@@ -196,7 +190,7 @@ class PAdaptationMetaLearner:
                         param.data.copy_(checkpoint_params[name])
 
             # Compute gradient at this checkpoint
-            # Average over a few batches for stability
+            # Averages over a few batches for stability (Not sure if this would be a problem for the narrative. Gradualism? Noise Filtering?)
             grad_accumulator = {name: torch.zeros_like(P[name]) for name in P.keys()}
             n_grad_batches = train_config.get('n_grad_batches', 5)
 
@@ -214,7 +208,7 @@ class PAdaptationMetaLearner:
                         if name in P and param.grad is not None:
                             grad_accumulator[name] += param.grad / n_grad_batches
 
-            # Compute contribution: P^{-1} ⊙ (Θ_n - Θ_0) ⊙ ∇L
+            # Compute contribution
             with torch.no_grad():
                 for name in P.keys():
                     P_inv = 1.0 / (P[name] + 1e-8)
@@ -225,9 +219,8 @@ class PAdaptationMetaLearner:
         return P_grad
 
     def update_and_renormalize_P(self, P, P_grad, meta_lr):
-        """Update P and renormalize: P* = (Tr(P) / Tr(P²)) * P"""
         
-        # CHANGED: Added gradient clipping for evolutionary stability
+        # Gradient Clipping for stability
         max_norm = 1.0
         total_norm = torch.norm(torch.stack([torch.norm(g) for g in P_grad.values()]))
         if total_norm > max_norm:
@@ -238,11 +231,11 @@ class PAdaptationMetaLearner:
 
         P_new = {}
         for name in P.keys():
-            # CHANGED: Changed '+' to '-' because we minimize loss (Fitness = -Loss)
+            # Changed sign because we're minimizing loss
             P_new[name] = P[name] - meta_lr * P_grad[name]
-            P_new[name] = torch.clamp(P_new[name], min=1e-6)  # Keep positive
+            P_new[name] = torch.clamp(P_new[name], min=1e-6) 
 
-        # Renormalize
+        # Renormalize!
         trace_P = sum(p.sum().item() for p in P_new.values())
         trace_P2 = sum((p**2).sum().item() for p in P_new.values())
         scale = trace_P / (trace_P2 + 1e-8)
@@ -255,7 +248,6 @@ class PAdaptationMetaLearner:
         return P_new
 
     def save_P(self, P, iteration, save_dir):
-        """Save plasticity mask"""
         save_path = os.path.join(save_dir, f'P_iter_{iteration}.pt')
         torch.save(P, save_path)
         print(f"  Saved P to {save_path}")
@@ -266,9 +258,6 @@ class PAdaptationMetaLearner:
                            num_iterations=10,
                            meta_learning_rate=0.1):
         """
-        Meta-learn P across language tasks. Each task: reset weights, train with P,
-        compute P gradient, update P. Only P is inherited.
-
         Args:
             dataset_dirs: List of data directories, each containing train.bin and meta.pkl
             train_config: Training hyperparameters
@@ -323,7 +312,7 @@ class PAdaptationMetaLearner:
             # Track convergence
             final_loss = np.mean([loss for _, loss in losses[-100:]])
             self.loss_history.append({
-                'iteration': iteration,
+                'iteration': iteration + 1,
                 'dataset': data_dir,
                 'final_loss': final_loss
             })
@@ -346,7 +335,7 @@ class PAdaptationMetaLearner:
             # Track P statistics
             P_stats = self.compute_P_statistics(self.P)
             self.P_history.append({
-                'iteration': iteration,
+                'iteration': iteration + 1,
                 'mean': P_stats['mean'],
                 'std': P_stats['std'],
                 'min': P_stats['min'],
@@ -443,12 +432,11 @@ def main():
         bias=True
     )
 
-    # CHANGED: SGD hyperparameters
     train_config = {
         'batch_size': 32,
         'learning_rate': 1e-2,       # Higher LR for SGD
         'max_iters': 1000,
-        'checkpoint_interval': 100,  # Checkpoint every 100 iters
+        'checkpoint_interval': 100, 
         'n_grad_batches': 10,        # Increased for stable selection pressure
         'weight_decay': 0.0,         # SGD doesn't strictly need L2 here
         'grad_clip': 1.0,
